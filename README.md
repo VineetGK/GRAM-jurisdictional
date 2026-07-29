@@ -1,4 +1,4 @@
-# GRAM for Law: Generic + Region-Adaptive Module Legal LLM
+# GRAM for Law: Gradient Routed Auxiliary Modules Legal LLM
 
 A modular legal language model with jurisdiction-specific adapters (US, EU, General) built on a shared Transformer core using LoRA.
 
