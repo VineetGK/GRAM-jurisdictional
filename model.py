@@ -2,25 +2,24 @@
 GRAM Legal LLM Model
 =====================
 
-GRAM (Generic + Region-Adaptive Module) architecture:
+GRAM (Gradient Routed Auxiliary Modules) architecture:
 - Shared core Transformer backbone (domain-general legal knowledge)
-- Jurisdiction-specific adapter modules (US, EU) with LoRA-like low-rank adapters
-- Gradient routing during training: core + jurisdiction-specific module
-- Inference: select core + relevant jurisdiction module
+- Jurisdiction-specific auxiliary MLP modules (US, EU) - extra neurons per layer
+- Gradient routing during training: core + active jurisdiction module only
+- Inference: select core + relevant jurisdiction module(s)
 
 Architecture:
 ```
-Input -> Embedding -> Core Transformer Layers -> [Core + Jurisdiction Module] -> LM Head -> Logits
-                                                         |
-                                                         +-- US Adapter (LoRA)
-                                                         +-- EU Adapter (LoRA)
-                                                         +-- General Adapter (optional)
+Input -> Embedding -> Core Transformer Blocks -> [Core + Jurisdiction Modules] -> LM Head -> Logits
+                                                |
+                                                +-- US Module (extra MLP neurons)
+                                                +-- EU Module (extra MLP neurons)
 ```
 
-Based on:
-- LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021)
-- AdapterFusion: Non-Destructive Task Composition for Transfer Learning (Pfeiffer et al., 2021)
-- Modular Deep Learning (various)
+Training (Gradient Routing):
+- US batch: freeze core + EU module, only US module gets gradients
+- EU batch: freeze core + US module, only EU module gets gradients  
+- General batch: unfreeze core + both modules
 """
 
 import math
@@ -49,16 +48,17 @@ class ModelConfig:
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     
-    adapter_rank: int = 16
-    adapter_alpha: float = 32.0
-    adapter_dropout: float = 0.1
-    
+    module_mlp_ratio: float = 0.25
     jurisdictions: List[Jurisdiction] = None
     
     def __post_init__(self):
         if self.jurisdictions is None:
             self.jurisdictions = ["US", "EU", "general"]
         assert self.d_model % self.n_heads == 0
+    
+    @property
+    def module_d_model(self) -> int:
+        return int(self.d_model * self.module_mlp_ratio)
 
 
 def get_model_config() -> ModelConfig:
@@ -71,68 +71,13 @@ def get_model_config() -> ModelConfig:
         d_ff=config.d_ff,
         dropout=config.dropout,
         layer_norm_eps=config.layer_norm_eps,
-        adapter_rank=config.adapter_rank,
-        adapter_alpha=config.adapter_alpha,
-        adapter_dropout=config.adapter_dropout,
+        module_mlp_ratio=config.module_mlp_ratio,
         jurisdictions=config.jurisdictions,
     )
 
 
-class LoRAAdapter(nn.Module):
-    """Low-Rank Adaptation module for jurisdiction-specific adaptation."""
-    
-    def __init__(
-        self,
-        d_model: int,
-        rank: int,
-        alpha: float,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        
-        self.lora_A = nn.Linear(d_model, rank, bias=False)
-        self.lora_B = nn.Linear(rank, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lora_B(self.dropout(self.lora_A(x))) * self.scaling
-    
-    def merge_weights(self):
-        """Merge LoRA weights into base layer (for inference optimization)."""
-        return self.lora_B.weight @ self.lora_A.weight * self.scaling
-
-
-class JurisdictionAdapter(nn.Module):
-    """Adapter module for a specific jurisdiction (US, EU, General)."""
-    
-    def __init__(self, config: ModelConfig, jurisdiction: Jurisdiction):
-        super().__init__()
-        self.jurisdiction = jurisdiction
-        self.config = config
-        
-        self.attention_adapter = LoRAAdapter(
-            config.d_model, config.adapter_rank, config.adapter_alpha, config.adapter_dropout
-        )
-        self.ffn_adapter = LoRAAdapter(
-            config.d_model, config.adapter_rank, config.adapter_alpha, config.adapter_dropout
-        )
-        self.layer_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.layer_norm(x)
-        x = self.attention_adapter(x) + self.ffn_adapter(x)
-        return residual + x
-
-
 class MultiHeadAttention(nn.Module):
-    """Standard multi-head attention with optional LoRA adapters."""
+    """Standard multi-head attention."""
     
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -159,18 +104,12 @@ class MultiHeadAttention(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        adapter: Optional[LoRAAdapter] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-        
-        if adapter is not None:
-            q = q + adapter(q.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)).view(
-                batch_size, seq_len, self.n_heads, self.d_head
-            ).transpose(1, 2)
         
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
         
@@ -192,8 +131,8 @@ class MultiHeadAttention(nn.Module):
         return output
 
 
-class FeedForward(nn.Module):
-    """Feed-forward network with optional LoRA adapter."""
+class CoreMLP(nn.Module):
+    """Core MLP (shared across all jurisdictions)."""
     
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -203,25 +142,41 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.GELU()
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        adapter: Optional[LoRAAdapter] = None,
-    ) -> torch.Tensor:
-        residual = x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
         x = self.activation(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        return x
+
+
+class JurisdictionMLP(nn.Module):
+    """Jurisdiction-specific auxiliary MLP (extra neurons)."""
+    
+    def __init__(self, config: ModelConfig, jurisdiction: Jurisdiction):
+        super().__init__()
+        self.jurisdiction = jurisdiction
+        self.config = config
+        self.module_d_model = config.module_d_model
         
-        if adapter is not None:
-            x = x + adapter(residual)
+        self.fc1 = nn.Linear(config.d_model, self.module_d_model)
+        self.fc2 = nn.Linear(self.module_d_model, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+        self.activation = nn.GELU()
         
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
         return x
 
 
 class TransformerBlock(nn.Module):
-    """Single Transformer block with attention and FFN, supporting jurisdiction adapters."""
+    """Single Transformer block with core MLP + optional jurisdiction MLPs."""
     
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
@@ -231,45 +186,49 @@ class TransformerBlock(nn.Module):
         self.ln1 = LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.attention = MultiHeadAttention(config)
         self.ln2 = LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.ffn = FeedForward(config)
+        self.core_mlp = CoreMLP(config)
         self.dropout = nn.Dropout(config.dropout)
+        
+        self.us_module = JurisdictionMLP(config, "US")
+        self.eu_module = JurisdictionMLP(config, "EU")
+        self.general_module = JurisdictionMLP(config, "general")
+        
+        self.enable_us_module: bool = True
+        self.enable_eu_module: bool = True
+        self.enable_general_module: bool = True
     
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        jurisdiction_adapters: Optional[Dict[Jurisdiction, JurisdictionAdapter]] = None,
-        active_jurisdiction: Optional[Jurisdiction] = None,
     ) -> torch.Tensor:
-        adapter = None
-        if jurisdiction_adapters and active_jurisdiction and active_jurisdiction in jurisdiction_adapters:
-            adapter = jurisdiction_adapters[active_jurisdiction]
-        
-        attn_out = self.attention(
-            self.ln1(x),
-            attention_mask,
-            adapter.attention_adapter if adapter else None,
-        )
+        attn_out = self.attention(self.ln1(x), attention_mask)
         x = x + self.dropout(attn_out)
         
-        ffn_out = self.ffn(
-            self.ln2(x),
-            adapter.ffn_adapter if adapter else None,
-        )
-        x = x + self.dropout(ffn_out)
+        core_out = self.core_mlp(self.ln2(x))
+        
+        module_out = torch.zeros_like(core_out)
+        if self.enable_us_module:
+            module_out = module_out + self.us_module(x)
+        if self.enable_eu_module:
+            module_out = module_out + self.eu_module(x)
+        if self.enable_general_module:
+            module_out = module_out + self.general_module(x)
+        
+        x = x + self.dropout(core_out + module_out)
         
         return x
 
 
 class GRAMModel(nn.Module):
     """
-    GRAM (Generic + Region-Adaptive Module) Legal Language Model.
+    GRAM (Gradient Routed Auxiliary Modules) Legal Language Model.
     
     Architecture:
     - Shared core Transformer backbone
-    - Jurisdiction-specific LoRA adapters per layer
-    - Gradient routing during training (core + active jurisdiction)
-    - Inference: select core + relevant jurisdiction module
+    - Jurisdiction-specific auxiliary MLPs per layer (extra neurons)
+    - Gradient routing during training (core + active jurisdiction only)
+    - Inference: select core + relevant jurisdiction module(s)
     """
     
     def __init__(self, config: ModelConfig):
@@ -289,18 +248,10 @@ class GRAMModel(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
         
-        self.jurisdiction_adapters = nn.ModuleDict({
-            jur: nn.ModuleList([
-                JurisdictionAdapter(config, jur) for _ in range(config.n_layers)
-            ])
-            for jur in config.jurisdictions
-        })
-        
         self.active_jurisdiction: Optional[Jurisdiction] = "core"
-        self.training_mode: bool = True
-        self.frozen_core: bool = False
         self.enable_us_module: bool = True
         self.enable_eu_module: bool = True
+        self.enable_general_module: bool = True
         
         self.apply(self._init_weights)
     
@@ -319,29 +270,55 @@ class GRAMModel(nn.Module):
         """Set active jurisdiction for inference."""
         assert jurisdiction in ["core"] + self.config.jurisdictions
         self.active_jurisdiction = jurisdiction
+        
+        for block in self.blocks:
+            if jurisdiction == "core":
+                block.enable_us_module = False
+                block.enable_eu_module = False
+                block.enable_general_module = False
+            elif jurisdiction == "US":
+                block.enable_us_module = True
+                block.enable_eu_module = False
+                block.enable_general_module = False
+            elif jurisdiction == "EU":
+                block.enable_us_module = False
+                block.enable_eu_module = True
+                block.enable_general_module = False
+            elif jurisdiction == "general":
+                block.enable_us_module = False
+                block.enable_eu_module = False
+                block.enable_general_module = True
     
-    def freeze_core(self, freeze: bool = True):
-        """Freeze/unfreeze core model parameters."""
-        self.frozen_core = freeze
+    def set_module_config(self, enable_us: bool, enable_eu: bool, enable_general: bool = False):
+        """Set module configuration for inference (Full/US-only/EU-only)."""
+        self.enable_us_module = enable_us
+        self.enable_eu_module = enable_eu
+        self.enable_general_module = enable_general
+        
+        for block in self.blocks:
+            block.enable_us_module = enable_us
+            block.enable_eu_module = enable_eu
+            block.enable_general_module = enable_general
+    
+    def route_gradients(self, jurisdiction: Jurisdiction):
+        """
+        GRAM gradient routing: freeze core + other jurisdiction modules,
+        only allow gradients for active jurisdiction module.
+        """
         for name, param in self.named_parameters():
-            if "jurisdiction_adapters" not in name:
-                param.requires_grad = not freeze
+            if "us_module" in name:
+                param.requires_grad = (jurisdiction == "US")
+            elif "eu_module" in name:
+                param.requires_grad = (jurisdiction == "EU")
+            elif "general_module" in name:
+                param.requires_grad = (jurisdiction == "general")
+            else:
+                param.requires_grad = (jurisdiction == "general")
     
-    def get_trainable_parameters(self, jurisdiction: Optional[Jurisdiction] = None):
-        """Get trainable parameters for a specific jurisdiction (core + jurisdiction adapters)."""
-        if jurisdiction is None:
-            jurisdiction = self.active_jurisdiction
-        
-        if jurisdiction == "core":
-            return [p for n, p in self.named_parameters() if "jurisdiction_adapters" not in n]
-        
-        params = []
-        for n, p in self.named_parameters():
-            if "jurisdiction_adapters" not in n:
-                params.append(p)
-            elif f"jurisdiction_adapters.{jurisdiction}" in n:
-                params.append(p)
-        return params
+    def unfreeze_all(self):
+        """Unfreeze all parameters (for general training phase)."""
+        for param in self.parameters():
+            param.requires_grad = True
     
     def forward(
         self,
@@ -361,32 +338,8 @@ class GRAMModel(nn.Module):
         x = self.token_embedding(input_ids) + self.position_embedding(pos_ids)
         x = self.dropout(x)
         
-        adapters = None
-        if jurisdiction != "core":
-            # Only include enabled modules
-            enabled_jurisdictions = []
-            if self.enable_us_module and "US" in self.config.jurisdictions:
-                enabled_jurisdictions.append("US")
-            if self.enable_eu_module and "EU" in self.config.jurisdictions:
-                enabled_jurisdictions.append("EU")
-            if "general" in self.config.jurisdictions:
-                enabled_jurisdictions.append("general")
-            
-            adapters = {
-                jur: self.jurisdiction_adapters[jur] for jur in enabled_jurisdictions
-            }
-        
-        for i, block in enumerate(self.blocks):
-            active_adapter = None
-            if adapters and jurisdiction != "core" and jurisdiction in adapters:
-                active_adapter = {jurisdiction: adapters[jurisdiction][i]}
-            
-            x = block(
-                x,
-                attention_mask,
-                active_adapter,
-                jurisdiction if jurisdiction != "core" else None,
-            )
+        for block in self.blocks:
+            x = block(x, attention_mask)
         
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -475,47 +428,25 @@ class GRAMModel(nn.Module):
         
         return input_ids
     
-    def merge_adapters(self, jurisdiction: Jurisdiction):
-        """Merge jurisdiction adapters into core weights for faster inference."""
-        if jurisdiction == "core":
-            return
-        
-        adapters = self.jurisdiction_adapters[jurisdiction]
-        
-        for i, block in enumerate(self.blocks):
-            adapter = adapters[i]
-            
-            lora_a_weight = adapter.attention_adapter.lora_A.weight
-            lora_b_weight = adapter.attention_adapter.lora_B.weight
-            scaling = adapter.attention_adapter.scaling
-            merged = lora_b_weight @ lora_a_weight * scaling
-            
-            block.attention.out_proj.weight.data += merged.T
-            
-            lora_a_weight = adapter.ffn_adapter.lora_A.weight
-            lora_b_weight = adapter.ffn_adapter.lora_B.weight
-            scaling = adapter.ffn_adapter.scaling
-            merged = lora_b_weight @ lora_a_weight * scaling
-            
-            block.ffn.fc2.weight.data += merged.T
-        
-        print(f"Merged {jurisdiction} adapters into core model")
-    
-    def unmerge_adapters(self, jurisdiction: Jurisdiction):
-        """Unmerge adapters (requires keeping original weights)."""
-        raise NotImplementedError("Unmerge requires storing original weights")
-    
     def get_jurisdiction_parameters(self, jurisdiction: Jurisdiction) -> int:
-        """Count parameters for a specific jurisdiction (core + adapters)."""
+        """Count parameters for a specific jurisdiction (core + that jurisdiction modules)."""
         if jurisdiction == "core":
             return sum(p.numel() for n, p in self.named_parameters() 
-                       if "jurisdiction_adapters" not in n)
+                       if "us_module" not in n and "eu_module" not in n and "general_module" not in n)
         
         core_params = sum(p.numel() for n, p in self.named_parameters() 
-                          if "jurisdiction_adapters" not in n)
-        adapter_params = sum(p.numel() for n, p in self.named_parameters()
-                             if f"jurisdiction_adapters.{jurisdiction}" in n)
-        return core_params + adapter_params
+                          if "us_module" not in n and "eu_module" not in n and "general_module" not in n)
+        
+        if jurisdiction == "US":
+            module_params = sum(p.numel() for n, p in self.named_parameters() if "us_module" in n)
+        elif jurisdiction == "EU":
+            module_params = sum(p.numel() for n, p in self.named_parameters() if "eu_module" in n)
+        elif jurisdiction == "general":
+            module_params = sum(p.numel() for n, p in self.named_parameters() if "general_module" in n)
+        else:
+            module_params = 0
+        
+        return core_params + module_params
     
     def print_parameter_count(self):
         """Print parameter counts for core and each jurisdiction."""
@@ -524,8 +455,8 @@ class GRAMModel(nn.Module):
         
         for jur in self.config.jurisdictions:
             total = self.get_jurisdiction_parameters(jur)
-            adapter_only = total - core_params
-            print(f"{jur} total: {total:,} ({total/1e6:.2f}M) | adapters only: {adapter_only:,} ({adapter_only/1e6:.2f}M)")
+            module_only = total - core_params
+            print(f"{jur} total: {total:,} ({total/1e6:.2f}M) | module only: {module_only:,} ({module_only/1e6:.2f}M)")
 
 
 def create_model(config: Optional[ModelConfig] = None) -> GRAMModel:
@@ -561,6 +492,12 @@ if __name__ == "__main__":
     print("\n=== Testing EU jurisdiction ===")
     model.set_jurisdiction("EU")
     out = model(input_ids, attention_mask, jurisdiction="EU")
+    print(f"Logits shape: {out['logits'].shape}")
+    print(f"Loss: {out['loss']}")
+    
+    print("\n=== Testing Full (US+EU) ===")
+    model.set_module_config(enable_us=True, enable_eu=True)
+    out = model(input_ids, attention_mask)
     print(f"Logits shape: {out['logits'].shape}")
     print(f"Loss: {out['loss']}")
     

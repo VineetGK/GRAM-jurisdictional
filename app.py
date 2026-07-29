@@ -85,9 +85,7 @@ def generate_response(
     input_ids = torch.tensor([encoded["input_ids"]], device=device)
     attention_mask = torch.tensor([encoded["attention_mask"]], device=device)
     
-    model.set_jurisdiction(jurisdiction)
-    model.enable_us_module = enable_us_module
-    model.enable_eu_module = enable_eu_module
+    model.set_module_config(enable_us=enable_us_module, enable_eu=enable_eu_module)
     
     with torch.no_grad():
         generated = model.generate(
