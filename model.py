@@ -1,408 +1,328 @@
-"""
-GRAM Legal LLM Model
-=====================
-
-GRAM (Gradient Routed Auxiliary Modules) architecture:
-- Shared core Transformer backbone (domain-general legal knowledge)
-- Jurisdiction-specific auxiliary MLP modules (US, EU) - extra neurons per layer
-- Gradient routing during training: core + active jurisdiction module only
-- Inference: select core + relevant jurisdiction module(s)
-
-Architecture:
-```
-Input -> Embedding -> Core Transformer Blocks -> [Core + Jurisdiction Modules] -> LM Head -> Logits
-                                                |
-                                                +-- US Module (extra MLP neurons)
-                                                +-- EU Module (extra MLP neurons)
-```
-
-Training (Gradient Routing):
-- US batch: freeze core + EU module, only US module gets gradients
-- EU batch: freeze core + US module, only EU module gets gradients  
-- General batch: unfreeze core + both modules
-"""
+"""GRAM-style Transformer model with modular auxiliary modules for US/EU jurisdictions."""
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Literal
+from typing import Optional, Tuple, List, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import LayerNorm
+from torch.nn import CrossEntropyLoss
 
 from config import config
 
 
-Jurisdiction = Literal["US", "EU", "general", "core"]
-
-
 @dataclass
 class ModelConfig:
-    vocab_size: int = 32000
-    max_seq_len: int = 1024
-    d_model: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    d_ff: int = 3072
-    dropout: float = 0.1
-    layer_norm_eps: float = 1e-5
-    
-    module_mlp_ratio: float = 0.25
-    jurisdictions: List[Jurisdiction] = None
-    
-    def __post_init__(self):
-        if self.jurisdictions is None:
-            self.jurisdictions = ["US", "EU", "general"]
-        assert self.d_model % self.n_heads == 0
-    
+    vocab_size: int = config.vocab_size
+    max_seq_len: int = config.max_seq_len
+    n_layers: int = config.n_layers
+    n_heads: int = config.n_heads
+    n_embd: int = config.n_embd
+    n_inner: int = config.n_inner
+    dropout: float = config.dropout
+    attn_dropout: float = config.attn_dropout
+    resid_dropout: float = config.resid_dropout
+    embd_pdrop: float = config.embd_pdrop
+    layer_norm_epsilon: float = config.layer_norm_epsilon
+    initializer_range: float = config.initializer_range
+    enable_us_module: bool = config.enable_us_module
+    enable_eu_module: bool = config.enable_eu_module
+    module_mlp_ratio: float = config.module_mlp_ratio
+
     @property
-    def module_d_model(self) -> int:
-        return int(self.d_model * self.module_mlp_ratio)
+    def head_dim(self) -> int:
+        return self.n_embd // self.n_heads
+
+    @property
+    def module_inner(self) -> int:
+        return int(self.n_inner * self.module_mlp_ratio)
 
 
-def get_model_config() -> ModelConfig:
-    return ModelConfig(
-        vocab_size=config.tokenizer_vocab_size,
-        max_seq_len=config.max_seq_len,
-        d_model=config.d_model,
-        n_layers=config.n_layers,
-        n_heads=config.n_heads,
-        d_ff=config.d_ff,
-        dropout=config.dropout,
-        layer_norm_eps=config.layer_norm_eps,
-        module_mlp_ratio=config.module_mlp_ratio,
-        jurisdictions=config.jurisdictions,
-    )
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention with flash attention support."""
 
-
-class MultiHeadAttention(nn.Module):
-    """Standard multi-head attention."""
-    
-    def __init__(self, config: ModelConfig):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.config = config
-        self.d_model = config.d_model
-        self.n_heads = config.n_heads
-        self.d_head = config.d_model // config.n_heads
-        
-        self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        
-        self.dropout = nn.Dropout(config.dropout)
-        
+        assert cfg.n_embd % cfg.n_heads == 0
+        self.cfg = cfg
+
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+
+        self.attn_dropout = nn.Dropout(cfg.attn_dropout)
+        self.resid_dropout = nn.Dropout(cfg.resid_dropout)
+
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.head_dim
+        self.scale = self.head_dim ** -0.5
+
         self.register_buffer(
-            "causal_mask",
-            torch.tril(torch.ones(config.max_seq_len, config.max_seq_len)).view(
-                1, 1, config.max_seq_len, config.max_seq_len
-            ),
+            "bias",
+            torch.tril(torch.ones(cfg.max_seq_len, cfg.max_seq_len))
+            .view(1, 1, cfg.max_seq_len, cfg.max_seq_len),
+            persistent=False,
         )
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        
-        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-        k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-        v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-        
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
-        
-        causal_mask = self.causal_mask[:, :, :seq_len, :seq_len]
-        attn_scores = attn_scores.masked_fill(causal_mask == 0, float("-inf"))
-        
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, C = x.shape
+
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.cfg.n_embd, dim=2)
+
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * self.scale
+
+        causal_mask = self.bias[:, :, :T, :T]
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
+
         if attention_mask is not None:
-            attn_scores = attn_scores.masked_fill(
-                attention_mask.view(batch_size, 1, 1, seq_len) == 0, float("-inf")
-            )
-        
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        
-        output = self.out_proj(attn_output)
-        return output
+            att = att + (1.0 - attention_mask[:, None, None, :]) * -1e9
+
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
-class CoreMLP(nn.Module):
-    """Core MLP (shared across all jurisdictions)."""
-    
-    def __init__(self, config: ModelConfig):
+class GPTMLP(nn.Module):
+    """Standard GPT-style MLP (GeGLU or GELU)."""
+
+    def __init__(self, cfg: ModelConfig, inner_dim: int = None):
         super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear(config.d_model, config.d_ff)
-        self.fc2 = nn.Linear(config.d_ff, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
-        self.activation = nn.GELU()
-    
+        inner = inner_dim or cfg.n_inner
+        self.c_fc = nn.Linear(cfg.n_embd, inner, bias=False)
+        self.c_proj = nn.Linear(inner, cfg.n_embd, bias=False)
+        self.dropout = nn.Dropout(cfg.resid_dropout)
+        self.act = nn.GELU(approximate='tanh')
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.activation(x)
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
         x = self.dropout(x)
-        x = self.fc2(x)
         return x
 
 
-class JurisdictionMLP(nn.Module):
-    """Jurisdiction-specific auxiliary MLP (extra neurons)."""
-    
-    def __init__(self, config: ModelConfig, jurisdiction: Jurisdiction):
-        super().__init__()
-        self.jurisdiction = jurisdiction
-        self.config = config
-        self.module_d_model = config.module_d_model
-        
-        self.fc1 = nn.Linear(config.d_model, self.module_d_model)
-        self.fc2 = nn.Linear(self.module_d_model, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
-        self.activation = nn.GELU()
-        
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+class GRAMBlock(nn.Module):
+    """
+    Transformer block with GRAM-style modular auxiliary MLPs.
+    Core MLP is always active. US/EU MLPs are conditionally active based on flags.
+    """
 
-
-class TransformerBlock(nn.Module):
-    """Single Transformer block with core MLP + optional jurisdiction MLPs."""
-    
-    def __init__(self, config: ModelConfig, layer_idx: int):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        
-        self.ln1 = LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.attention = MultiHeadAttention(config)
-        self.ln2 = LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.core_mlp = CoreMLP(config)
-        self.dropout = nn.Dropout(config.dropout)
-        
-        self.us_module = JurisdictionMLP(config, "US")
-        self.eu_module = JurisdictionMLP(config, "EU")
-        self.general_module = JurisdictionMLP(config, "general")
-        
-        self.enable_us_module: bool = True
-        self.enable_eu_module: bool = True
-        self.enable_general_module: bool = True
-    
+        self.cfg = cfg
+
+        self.ln_1 = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln_2 = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
+
+        # Core MLP (always active)
+        self.core_mlp = GPTMLP(cfg)
+
+        # Auxiliary modules
+        self.enable_us_module = cfg.enable_us_module
+        self.enable_eu_module = cfg.enable_eu_module
+
+        if self.enable_us_module:
+            self.us_mlp = GPTMLP(cfg, inner_dim=cfg.module_inner)
+            self.us_ln = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
+
+        if self.enable_eu_module:
+            self.eu_mlp = GPTMLP(cfg, inner_dim=cfg.module_inner)
+            self.eu_ln = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        enable_us: bool = True,
+        enable_eu: bool = True,
     ) -> torch.Tensor:
-        attn_out = self.attention(self.ln1(x), attention_mask)
-        x = x + self.dropout(attn_out)
-        
-        core_out = self.core_mlp(self.ln2(x))
-        
+        # Self-attention (always active)
+        residual = x
+        x = self.ln_1(x)
+        x = self.attn(x, attention_mask)
+        x = residual + x
+
+        # Core MLP (always active)
+        residual = x
+        x = self.ln_2(x)
+        core_out = self.core_mlp(x)
+
+        # Module outputs (conditionally active)
         module_out = torch.zeros_like(core_out)
-        if self.enable_us_module:
-            module_out = module_out + self.us_module(x)
-        if self.enable_eu_module:
-            module_out = module_out + self.eu_module(x)
-        if self.enable_general_module:
-            module_out = module_out + self.general_module(x)
-        
-        x = x + self.dropout(core_out + module_out)
-        
+
+        if self.enable_us_module and enable_us:
+            us_out = self.us_mlp(self.us_ln(x))
+            module_out = module_out + us_out
+
+        if self.enable_eu_module and enable_eu:
+            eu_out = self.eu_mlp(self.eu_ln(x))
+            module_out = module_out + eu_out
+
+        x = residual + core_out + module_out
         return x
 
+    def set_module_grad(self, us_grad: bool, eu_grad: bool, core_grad: bool = True):
+        """Set requires_grad for module parameters (for GRAM routing)."""
+        for p in self.core_mlp.parameters():
+            p.requires_grad = core_grad
 
-class GRAMModel(nn.Module):
+        if self.enable_us_module:
+            for p in self.us_mlp.parameters():
+                p.requires_grad = us_grad
+            for p in self.us_ln.parameters():
+                p.requires_grad = us_grad
+
+        if self.enable_eu_module:
+            for p in self.eu_mlp.parameters():
+                p.requires_grad = eu_grad
+            for p in self.eu_ln.parameters():
+                p.requires_grad = eu_grad
+
+
+class GRAMTransformer(nn.Module):
     """
-    GRAM (Gradient Routed Auxiliary Modules) Legal Language Model.
-    
-    Architecture:
-    - Shared core Transformer backbone
-    - Jurisdiction-specific auxiliary MLPs per layer (extra neurons)
-    - Gradient routing during training (core + active jurisdiction only)
-    - Inference: select core + relevant jurisdiction module(s)
+    GRAM-style decoder-only Transformer with jurisdiction-aware modules.
+    Supports runtime configuration of enabled modules.
     """
-    
-    def __init__(self, config: ModelConfig):
+
+    def __init__(self, cfg: ModelConfig = None):
         super().__init__()
-        self.config = config
-        
-        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embedding = nn.Embedding(config.max_seq_len, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
-        
-        self.blocks = nn.ModuleList([
-            TransformerBlock(config, i) for i in range(config.n_layers)
-        ])
-        
-        self.ln_f = LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding.weight
-        
-        self.active_jurisdiction: Optional[Jurisdiction] = "core"
-        self.enable_us_module: bool = True
-        self.enable_eu_module: bool = True
-        self.enable_general_module: bool = True
-        
+        self.cfg = cfg or ModelConfig()
+        self.enable_us_module = self.cfg.enable_us_module
+        self.enable_eu_module = self.cfg.enable_eu_module
+
+        self.transformer = nn.ModuleDict(dict(
+            wte=nn.Embedding(self.cfg.vocab_size, self.cfg.n_embd),
+            wpe=nn.Embedding(self.cfg.max_seq_len, self.cfg.n_embd),
+            drop=nn.Dropout(self.cfg.embd_pdrop),
+            h=nn.ModuleList([GRAMBlock(self.cfg) for _ in range(self.cfg.n_layers)]),
+            ln_f=nn.LayerNorm(self.cfg.n_embd, eps=self.cfg.layer_norm_epsilon),
+        ))
+
+        self.lm_head = nn.Linear(self.cfg.n_embd, self.cfg.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight  # weight tying
+
         self.apply(self._init_weights)
-    
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.cfg.initializer_range)
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-    
-    def set_jurisdiction(self, jurisdiction: Jurisdiction):
-        """Set active jurisdiction for inference."""
-        assert jurisdiction in ["core"] + self.config.jurisdictions
-        self.active_jurisdiction = jurisdiction
-        
-        for block in self.blocks:
-            if jurisdiction == "core":
-                block.enable_us_module = False
-                block.enable_eu_module = False
-                block.enable_general_module = False
-            elif jurisdiction == "US":
-                block.enable_us_module = True
-                block.enable_eu_module = False
-                block.enable_general_module = False
-            elif jurisdiction == "EU":
-                block.enable_us_module = False
-                block.enable_eu_module = True
-                block.enable_general_module = False
-            elif jurisdiction == "general":
-                block.enable_us_module = False
-                block.enable_eu_module = False
-                block.enable_general_module = True
-    
-    def set_module_config(self, enable_us: bool, enable_eu: bool, enable_general: bool = False):
-        """Set module configuration for inference (Full/US-only/EU-only)."""
-        self.enable_us_module = enable_us
-        self.enable_eu_module = enable_eu
-        self.enable_general_module = enable_general
-        
-        for block in self.blocks:
-            block.enable_us_module = enable_us
-            block.enable_eu_module = enable_eu
-            block.enable_general_module = enable_general
-    
-    def route_gradients(self, jurisdiction: Jurisdiction):
-        """
-        GRAM gradient routing: freeze core + other jurisdiction modules,
-        only allow gradients for active jurisdiction module.
-        """
-        for name, param in self.named_parameters():
-            if "us_module" in name:
-                param.requires_grad = (jurisdiction == "US")
-            elif "eu_module" in name:
-                param.requires_grad = (jurisdiction == "EU")
-            elif "general_module" in name:
-                param.requires_grad = (jurisdiction == "general")
-            else:
-                param.requires_grad = (jurisdiction == "general")
-    
-    def unfreeze_all(self):
-        """Unfreeze all parameters (for general training phase)."""
-        for param in self.parameters():
-            param.requires_grad = True
-    
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.cfg.initializer_range)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        jurisdiction: Optional[Jurisdiction] = None,
-        return_dict: bool = True,
+        enable_us_module: bool = None,
+        enable_eu_module: bool = None,
     ) -> Dict[str, torch.Tensor]:
-        batch_size, seq_len = input_ids.shape
-        
-        if jurisdiction is None:
-            jurisdiction = self.active_jurisdiction
-        
-        pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        
-        x = self.token_embedding(input_ids) + self.position_embedding(pos_ids)
-        x = self.dropout(x)
-        
-        for block in self.blocks:
-            x = block(x, attention_mask)
-        
-        x = self.ln_f(x)
+        """
+        Forward pass with optional module control.
+        Args:
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+            labels: (batch_size, seq_len) for loss computation
+            enable_us_module: override US module flag
+            enable_eu_module: override EU module flag
+        """
+        us_enabled = self.enable_us_module if enable_us_module is None else enable_us_module
+        eu_enabled = self.enable_eu_module if enable_eu_module is None else enable_eu_module
+
+        B, T = input_ids.shape
+        assert T <= self.cfg.max_seq_len, f"Sequence length {T} exceeds max {self.cfg.max_seq_len}"
+
+        pos = torch.arange(0, T, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+
+        tok_emb = self.transformer.wte(input_ids)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+
+        for block in self.transformer.h:
+            x = block(x, attention_mask, enable_us=us_enabled, enable_eu=eu_enabled)
+
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        
+
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
-                ignore_index=-100,
             )
-        
-        if not return_dict:
-            return (logits, loss) if loss is not None else (logits,)
-        
+
         return {
             "logits": logits,
             "loss": loss,
             "hidden_states": x,
         }
-    
-    @torch.no_grad()
+
     def generate(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.8,
         top_k: int = 50,
-        top_p: float = 0.9,
-        jurisdiction: Optional[Jurisdiction] = None,
-        eos_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.1,
+        enable_us_module: bool = None,
+        enable_eu_module: bool = None,
+        eos_token_id: int = None,
+        pad_token_id: int = None,
     ) -> torch.Tensor:
-        """Generate text with jurisdiction conditioning."""
+        """Generate text using the model."""
         self.eval()
-        
-        if jurisdiction is not None:
-            self.set_jurisdiction(jurisdiction)
-        
-        batch_size = input_ids.shape[0]
-        
+        us_enabled = self.enable_us_module if enable_us_module is None else enable_us_module
+        eu_enabled = self.enable_eu_module if enable_eu_module is None else enable_eu_module
+
+        generated = input_ids.clone()
+        past_key_values = None
+
         for _ in range(max_new_tokens):
-            if input_ids.shape[1] >= self.config.max_seq_len:
-                input_ids = input_ids[:, -self.config.max_seq_len:]
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, -self.config.max_seq_len:]
-            
-            outputs = self.forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                jurisdiction=jurisdiction,
-            )
-            logits = outputs["logits"][:, -1, :]
-            
-            logits = logits / temperature
-            
+            # Crop context if too long
+            if generated.shape[1] > self.cfg.max_seq_len:
+                generated = generated[:, -self.cfg.max_seq_len:]
+
+            with torch.no_grad():
+                outputs = self.forward(
+                    generated,
+                    enable_us_module=us_enabled,
+                    enable_eu_module=eu_enabled,
+                )
+                logits = outputs["logits"][:, -1, :] / temperature
+
+            # Repetition penalty
+            if repetition_penalty != 1.0:
+                for i in range(generated.shape[0]):
+                    for token_id in set(generated[i].tolist()):
+                        logits[i, token_id] /= repetition_penalty
+
+            # Top-k filtering
             if top_k > 0:
                 indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                logits[indices_to_remove] = float("-inf")
-            
+                logits[indices_to_remove] = -float('inf')
+
+            # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -410,98 +330,117 @@ class GRAMModel(nn.Module):
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float("-inf")
-            
+                logits[indices_to_remove] = -float('inf')
+
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            
-            if attention_mask is not None:
-                attention_mask = torch.cat([
-                    attention_mask,
-                    torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)
-                ], dim=-1)
-            
+            generated = torch.cat([generated, next_token], dim=1)
+
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
-        
-        return input_ids
-    
-    def get_jurisdiction_parameters(self, jurisdiction: Jurisdiction) -> int:
-        """Count parameters for a specific jurisdiction (core + that jurisdiction modules)."""
-        if jurisdiction == "core":
-            return sum(p.numel() for n, p in self.named_parameters() 
-                       if "us_module" not in n and "eu_module" not in n and "general_module" not in n)
-        
-        core_params = sum(p.numel() for n, p in self.named_parameters() 
-                          if "us_module" not in n and "eu_module" not in n and "general_module" not in n)
-        
-        if jurisdiction == "US":
-            module_params = sum(p.numel() for n, p in self.named_parameters() if "us_module" in n)
-        elif jurisdiction == "EU":
-            module_params = sum(p.numel() for n, p in self.named_parameters() if "eu_module" in n)
-        elif jurisdiction == "general":
-            module_params = sum(p.numel() for n, p in self.named_parameters() if "general_module" in n)
-        else:
-            module_params = 0
-        
-        return core_params + module_params
-    
-    def print_parameter_count(self):
-        """Print parameter counts for core and each jurisdiction."""
-        core_params = self.get_jurisdiction_parameters("core")
-        print(f"Core parameters: {core_params:,} ({core_params/1e6:.2f}M)")
-        
-        for jur in self.config.jurisdictions:
-            total = self.get_jurisdiction_parameters(jur)
-            module_only = total - core_params
-            print(f"{jur} total: {total:,} ({total/1e6:.2f}M) | module only: {module_only:,} ({module_only/1e6:.2f}M)")
+
+        return generated
+
+    def set_module_grad(self, us_grad: bool, eu_grad: bool, core_grad: bool = True):
+        """Set requires_grad for all blocks (for GRAM gradient routing)."""
+        for block in self.transformer.h:
+            block.set_module_grad(us_grad, eu_grad, core_grad)
+
+    def get_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
+        """Get parameter groups for optimizer (core, us, eu)."""
+        groups = {"core": [], "us": [], "eu": []}
+
+        # Embedding and output layers go to core
+        for p in self.transformer.wte.parameters():
+            groups["core"].append(p)
+        for p in self.transformer.wpe.parameters():
+            groups["core"].append(p)
+        for p in self.transformer.ln_f.parameters():
+            groups["core"].append(p)
+        for p in self.lm_head.parameters():
+            groups["core"].append(p)
+
+        for block in self.transformer.h:
+            for p in block.ln_1.parameters():
+                groups["core"].append(p)
+            for p in block.attn.parameters():
+                groups["core"].append(p)
+            for p in block.ln_2.parameters():
+                groups["core"].append(p)
+            for p in block.core_mlp.parameters():
+                groups["core"].append(p)
+
+            if self.enable_us_module:
+                for p in block.us_mlp.parameters():
+                    groups["us"].append(p)
+                for p in block.us_ln.parameters():
+                    groups["us"].append(p)
+
+            if self.enable_eu_module:
+                for p in block.eu_mlp.parameters():
+                    groups["eu"].append(p)
+                for p in block.eu_ln.parameters():
+                    groups["eu"].append(p)
+
+        return groups
+
+    def set_config(self, enable_us_module: bool = None, enable_eu_module: bool = None):
+        """Update module enable flags at runtime."""
+        if enable_us_module is not None:
+            self.enable_us_module = enable_us_module
+        if enable_eu_module is not None:
+            self.enable_eu_module = enable_eu_module
+
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def num_parameters_per_module(self) -> Dict[str, int]:
+        groups = self.get_parameter_groups()
+        return {k: sum(p.numel() for p in v) for k, v in groups.items()}
 
 
-def create_model(config: Optional[ModelConfig] = None) -> GRAMModel:
+def create_model(cfg: ModelConfig = None) -> GRAMTransformer:
     """Factory function to create GRAM model."""
-    if config is None:
-        config = get_model_config()
-    model = GRAMModel(config)
-    model.print_parameter_count()
-    return model
+    return GRAMTransformer(cfg)
 
 
 if __name__ == "__main__":
-    config = get_model_config()
-    model = create_model(config)
-    
+    # Test model
+    print("Creating GRAM model...")
+    model = create_model()
+    print(f"Total parameters: {model.num_parameters():,}")
+    print(f"Parameters per module: {model.num_parameters_per_module()}")
+
+    # Test forward
     batch_size = 2
     seq_len = 128
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
     attention_mask = torch.ones(batch_size, seq_len)
-    
-    print("\n=== Testing CORE forward ===")
-    model.set_jurisdiction("core")
-    out = model(input_ids, attention_mask, jurisdiction="core")
+
+    print("\nTesting forward pass (Full)...")
+    out = model(input_ids, attention_mask, enable_us_module=True, enable_eu_module=True)
     print(f"Logits shape: {out['logits'].shape}")
     print(f"Loss: {out['loss']}")
-    
-    print("\n=== Testing US jurisdiction ===")
-    model.set_jurisdiction("US")
-    out = model(input_ids, attention_mask, jurisdiction="US")
+
+    print("\nTesting forward pass (US-only)...")
+    out = model(input_ids, attention_mask, enable_us_module=True, enable_eu_module=False)
     print(f"Logits shape: {out['logits'].shape}")
-    print(f"Loss: {out['loss']}")
-    
-    print("\n=== Testing EU jurisdiction ===")
-    model.set_jurisdiction("EU")
-    out = model(input_ids, attention_mask, jurisdiction="EU")
+
+    print("\nTesting forward pass (EU-only)...")
+    out = model(input_ids, attention_mask, enable_us_module=False, enable_eu_module=True)
     print(f"Logits shape: {out['logits'].shape}")
-    print(f"Loss: {out['loss']}")
-    
-    print("\n=== Testing Full (US+EU) ===")
-    model.set_module_config(enable_us=True, enable_eu=True)
-    out = model(input_ids, attention_mask)
-    print(f"Logits shape: {out['logits'].shape}")
-    print(f"Loss: {out['loss']}")
-    
-    print("\n=== Testing generation ===")
-    prompt = input_ids[:1, :10]
-    generated = model.generate(prompt, max_new_tokens=20, jurisdiction="US")
+
+    print("\nTesting generate...")
+    generated = model.generate(input_ids[:, :10], max_new_tokens=20, enable_us_module=True, enable_eu_module=True)
     print(f"Generated shape: {generated.shape}")
+
+    print("\nTesting gradient routing...")
+    model.set_module_grad(us_grad=True, eu_grad=False, core_grad=False)
+    us_params_grad = sum(p.requires_grad for p in model.parameters() if any(p in g for g in model.get_parameter_groups()["us"]))
+    print(f"US params with grad: {us_params_grad}")
+
+    model.set_module_grad(us_grad=False, eu_grad=True, core_grad=False)
+    eu_params_grad = sum(p.requires_grad for p in model.parameters() if any(p in g for g in model.get_parameter_groups()["eu"]))
+    print(f"EU params with grad: {eu_params_grad}")
+
+    print("\nAll tests passed!")

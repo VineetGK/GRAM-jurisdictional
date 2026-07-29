@@ -1,141 +1,134 @@
-# GRAM for Law: Gradient Routed Auxiliary Modules Legal LLM
+# GRAM for Law: Jurisdiction-Aware Legal Language Model
 
-A modular legal language model with jurisdiction-specific adapters (US, EU, General) built on a shared Transformer core using LoRA.
+Implementation of **GRAM (Gradient-Routed Auxiliary Modules)** for modular pretraining of a legal LLM with US and EU jurisdiction modules, plus a Streamlit chat interface.
+
+Based on: *Modular Pretraining Enables Access Control* (GRAM paper)
 
 ## Architecture
 
 ```
-Input → Embedding → Core Transformer (12 layers) → [Core + Jurisdiction Adapter] → LM Head → Logits
-                                                     ├── US Adapter (LoRA rank=16)
-                                                     ├── EU Adapter (LoRA rank=16)
-                                                     └── General Adapter (LoRA rank=16)
+┌─────────────────────────────────────────────┐
+│           GRAM Transformer Block            │
+├─────────────────────────────────────────────┤
+│  Core MLP (always active)                   │
+│  ┌─────────────┐  ┌─────────────┐           │
+│  │ US Module   │  │ EU Module   │  (conditionally active) │
+│  │ MLP + LN    │  │ MLP + LN    │           │
+│  └─────────────┘  └─────────────┘           │
+└─────────────────────────────────────────────┘
 ```
 
-**Key Features:**
-- **Gradient Routing**: During training, gradients flow only to core + active jurisdiction adapter
-- **Parameter Efficient**: ~768K adapter params per jurisdiction vs 124M core params
-- **Modular Inference**: Switch jurisdictions at runtime without reloading
-- **Ablation Ready**: Evaluate core-only, core+US, core+EU, core+general configs
+### Three Configurations
+| Config | Core | US Module | EU Module |
+|--------|------|-----------|-----------|
+| **Full** | ✓ | ✓ | ✓ |
+| **US-only** | ✓ | ✓ | ✗ |
+| **EU-only** | ✓ | ✗ | ✓ |
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+### 1. Train Tokenizer
+```bash
+python tokenizer.py --vocab-size 32000
+```
+
+### 2. Train Model (GRAM)
+```bash
+python train.py
+```
+
+Training has two phases:
+- **Phase 1 (Warmup)**: General corpus, updates all parameters (~2000 steps)
+- **Phase 2 (GRAM)**: Alternates US/EU batches with gradient routing (~8000 steps)
+
+### 3. Run Evaluation (Ablation)
+```bash
+python evaluate.py
+```
+
+### 4. Launch Streamlit App
+```bash
+streamlit run app.py
+```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `config.py` | Hyperparameters, paths, device config |
-| `tokenizer.py` | BPE tokenizer training/loading (32K vocab) |
-| `datasets.py` | US/EU/General dataset download, preprocessing, DataLoaders |
-| `model.py` | GRAMModel with LoRA adapters per jurisdiction |
-| `train.py` | GRAM training loop with gradient routing |
-| `evaluate.py` | Perplexity evaluation + ablation study |
-| `app.py` | Streamlit chat interface with jurisdiction selector |
+| `config.py` | Hyperparameters, paths, model config |
+| `tokenizer.py` | BPE tokenizer training/loading |
+| `datasets.py` | Data loading, chunking, DataLoaders |
+| `model.py` | GRAM Transformer with modular MLPs |
+| `train.py` | Training loop with GRAM gradient routing |
+| `evaluate.py` | Ablation experiments (Full/US-only/EU-only) |
+| `app.py` | Streamlit chat interface |
 
-## Quick Start
+## GRAM Gradient Routing
 
-```bash
-cd "E:\Projects Github\GRAM for Law"
+During **Phase 2 (GRAM phase)**:
 
-# Create environment
-python -m venv venv
-venv\Scripts\activate
+| Batch Jurisdiction | Core Params | US Module | EU Module |
+|-------------------|-------------|-----------|-----------|
+| US | Frozen* | **Updated** | Frozen |
+| EU | Frozen* | Frozen | **Updated** |
+| General | Updated | Updated | Updated |
 
-# Install dependencies
-pip install torch transformers tokenizers datasets accelerate streamlit tqdm
+*Configurable via `freeze_core_during_gram` and `freeze_other_module_during_gram`
 
-# 1. Train tokenizer (downloads data, trains 32K BPE)
-python tokenizer.py
+## Model Details
 
-# 2. Train model (GRAM gradient routing)
-python train.py
+- **Architecture**: 12-layer decoder-only Transformer (~100M params)
+- **Hidden size**: 768, **Heads**: 12, **FFN**: 3072
+- **Modules**: Core MLP (3072) + US MLP (768) + EU MLP (768) per layer
+- **Context**: 512 tokens
+- **Tokenizer**: BPE, 32k vocab, legal special tokens (`<|us|>`, `<|eu|>`, `<|general|>`)
 
-# 3. Evaluate (perplexity + ablations)
-python evaluate.py
+## Datasets
 
-# 4. Chat interface
-streamlit run app.py
-```
+| Dataset | Source | Jurisdiction |
+|---------|--------|--------------|
+| US Caselaw | HuggingFace `free-law/Caselaw_Access_Project` | US |
+| EU Law | HuggingFace `lex_glue` (EUR-Lex) | EU |
+| General | Wikipedia (optional) | General |
 
-## Configuration
+## Streamlit App Features
 
-Edit `config.py` to customize:
-- Model size: `d_model`, `n_layers`, `n_heads`
-- Adapter config: `adapter_rank`, `adapter_alpha`
-- Training: `batch_size`, `learning_rate`, `max_steps`
-- Data: `max_samples_us`, `max_samples_eu`, `max_samples_general`
-- Paths: `data_dir`, `tokenizer_dir`, `checkpoint_dir`
+- **Mode selector**: Full / US-only / EU-only
+- **Chat interface** with conversation history
+- **Config badges** showing active mode on each response
+- **Generation controls**: temperature, top-k, top-p, repetition penalty
+- **Example prompts** for US, EU, and comparative questions
 
-## Training Details
-
-**Gradient Routing Modes:**
-- `jurisdiction` (default): Core + active jurisdiction adapter
-- `all`: All parameters
-- `core_only`: Freeze all adapters
-
-**Jurisdiction Schedules:**
-- `mixed`: Random batch jurisdiction
-- `sequential`: US epoch → EU epoch → General epoch
-
-## Data Sources
-
-| Jurisdiction | Dataset | Source |
-|-------------|---------|--------|
-| US | Caselaw Access Project | Harvard Law / Free Law Project |
-| EU | EurLex | European Union Law |
-| General | Wikipedia | Wikimedia |
-
-*Downloads automatically on first run. Uses dummy data if unavailable.*
-
-## Evaluation
+## Training Monitoring
 
 ```bash
-python evaluate.py
+tensorboard --logdir logs/
 ```
 
-Outputs:
-- Perplexity per jurisdiction (US, EU, General)
-- Ablation table: Full / US-only / EU-only / Core-only
-- Parameter counts per configuration
+## Customization
 
-## Streamlit App
+Edit `config.py` to adjust:
+- Model size (`n_layers`, `n_heads`, `n_embd`)
+- Training steps, batch size, learning rate
+- GRAM routing behavior
+- Data paths and sample sizes
 
-```bash
-streamlit run app.py
-```
+## TODO (Production)
 
-Features:
-- Sidebar: Checkpoint selector, jurisdiction (US/EU/General), generation params
-- Chat interface with history
-- Model architecture details panel
-- Special tokens reference
+- [ ] Distributed training (DDP/FSDP)
+- [ ] Flash Attention 2
+- [ ] Gradient checkpointing
+- [ ] Better data cleaning for legal texts
+- [ ] Instruction tuning / RLHF
+- [ ] Quantization (GGUF/GPTQ) for deployment
+- [ ] RAG integration for citations
 
-## Requirements
+## License
 
-```
-torch>=2.0.0
-transformers>=4.30.0
-tokenizers>=0.13.0
-datasets>=2.12.0
-accelerate>=0.20.0
-streamlit>=1.25.0
-tqdm>=4.65.0
-numpy>=1.24.0
-```
-
-## Project Structure
-
-```
-GRAM for Law/
-├── config.py
-├── tokenizer.py
-├── datasets.py
-├── model.py
-├── train.py
-├── evaluate.py
-├── app.py
-├── requirements.txt
-├── README.md
-├── data/              # Downloaded corpora
-├── tokenizer/         # Trained BPE tokenizer
-├── checkpoints/       # Model checkpoints
-├── logs/              # Training logs
-└── outputs/           # Evaluation results
-```
+Research prototype. Legal datasets have their own licenses (public domain for US caselaw, EUR-Lex for EU law).
