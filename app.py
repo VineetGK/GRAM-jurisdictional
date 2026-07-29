@@ -132,7 +132,7 @@ def format_prompt(messages: list, jurisdiction: str) -> str:
 
 def main():
     st.title("⚖️ GRAM Legal LLM")
-    st.caption("Generic + Region-Adaptive Module for Legal Language Modeling")
+    st.caption("Gradient Routed Auxiliary Modules for Legal Language Modeling")
     
     with st.sidebar:
         st.header("⚙️ Configuration")
