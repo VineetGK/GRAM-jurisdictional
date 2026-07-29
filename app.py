@@ -191,7 +191,7 @@ def render_sidebar():
             help="Select which modules are active",
         )
 
-        config = config.app_mode_to_config[mode]
+        selected_config = config.app_mode_to_config[mode]
 
         # Display active config
         config_class = get_config_class(config)
@@ -204,9 +204,9 @@ def render_sidebar():
         st.markdown("**Module Status:**")
         col1, col2 = st.columns(2)
         with col1:
-            st.checkbox("US Module", value=config["enable_us_module"], disabled=True)
+            st.checkbox("US Module", value=selected_config["enable_us_module"], disabled=True)
         with col2:
-            st.checkbox("EU Module", value=config["enable_eu_module"], disabled=True)
+            st.checkbox("EU Module", value=selected_config["enable_eu_module"], disabled=True)
 
         st.markdown("---")
 
@@ -271,7 +271,7 @@ def render_sidebar():
 
         return {
             "mode": mode,
-            "config": config,
+            "config": selected_config,
             "generation_params": {
                 "temperature": temperature,
                 "top_k": top_k,
@@ -399,11 +399,11 @@ def main():
 
     # Render sidebar and get config
     sidebar_state = render_sidebar()
-    config = sidebar_state["config"]
+    ui_config = sidebar_state["config"]
     generation_params = sidebar_state["generation_params"]
 
     # Store current config in session
-    st.session_state.current_config = config
+    st.session_state.current_config = ui_config
 
     # Handle example prompt
     if "example_prompt" in st.session_state:
@@ -413,8 +413,8 @@ def main():
 
     # Load model with current config
     model, tokenizer = load_model_and_tokenizer(
-        enable_us_module=config["enable_us_module"],
-        enable_eu_module=config["enable_eu_module"],
+        enable_us_module=ui_config["enable_us_module"],
+        enable_eu_module=ui_config["enable_eu_module"],
     )
 
     if model is None or tokenizer is None:
