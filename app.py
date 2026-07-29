@@ -3,7 +3,7 @@ GRAM Legal LLM - Streamlit Chat Interface
 ==========================================
 
 Interactive chat interface for the GRAM Legal Language Model.
-Supports jurisdiction switching (US, EU, General) and real-time generation.
+Switches between Full (US+EU), US-only, and EU-only configurations.
 
 Run: streamlit run app.py
 """
@@ -11,7 +11,6 @@ Run: streamlit run app.py
 import streamlit as st
 import torch
 from pathlib import Path
-import json
 
 from config import config
 from model import GRAMModel, ModelConfig
@@ -70,13 +69,16 @@ def generate_response(
     tokenizer,
     device,
     prompt: str,
-    jurisdiction: str,
+    enable_us_module: bool,
+    enable_eu_module: bool,
     max_new_tokens: int = 256,
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.9,
 ) -> str:
-    """Generate response from the model."""
+    """Generate response from the model with specified module configuration."""
+    
+    jurisdiction = "US" if enable_us_module else ("EU" if enable_eu_module else "general")
     
     encoded = encode_with_jurisdiction(tokenizer, prompt, jurisdiction, max_length=config.max_seq_len - max_new_tokens)
     
@@ -84,6 +86,8 @@ def generate_response(
     attention_mask = torch.tensor([encoded["attention_mask"]], device=device)
     
     model.set_jurisdiction(jurisdiction)
+    model.enable_us_module = enable_us_module
+    model.enable_eu_module = enable_eu_module
     
     with torch.no_grad():
         generated = model.generate(
@@ -147,12 +151,20 @@ def main():
         if selected_checkpoint != "None (random init)":
             checkpoint_path = str(checkpoint_dir / selected_checkpoint)
         
-        jurisdiction = st.selectbox(
-            "Jurisdiction",
-            ["US", "EU", "general"],
+        st.subheader("Model Configuration")
+        config_mode = st.selectbox(
+            "Configuration",
+            ["Full (US + EU)", "US-only", "EU-only"],
             index=0,
-            help="Select legal jurisdiction for generation",
+            help=(
+                "Full: core + US module + EU module\n"
+                "US-only: core + US module, EU disabled\n"
+                "EU-only: core + EU module, US disabled"
+            ),
         )
+        
+        enable_us_module = config_mode in ["Full (US + EU)", "US-only"]
+        enable_eu_module = config_mode in ["Full (US + EU)", "EU-only"]
         
         st.divider()
         
@@ -206,6 +218,7 @@ def main():
         
         with st.chat_message("assistant"):
             with st.spinner("Generating response..."):
+                jurisdiction = "US" if enable_us_module else ("EU" if enable_eu_module else "general")
                 formatted_prompt = format_prompt(st.session_state.messages, jurisdiction)
                 
                 response = generate_response(
@@ -213,7 +226,8 @@ def main():
                     tokenizer,
                     device,
                     formatted_prompt,
-                    jurisdiction,
+                    enable_us_module=enable_us_module,
+                    enable_eu_module=enable_eu_module,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_k=top_k,
@@ -221,6 +235,7 @@ def main():
                 )
                 
                 st.markdown(response)
+                st.caption(f"Mode: {config_mode}")
         
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()

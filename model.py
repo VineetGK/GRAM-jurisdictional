@@ -299,6 +299,8 @@ class GRAMModel(nn.Module):
         self.active_jurisdiction: Optional[Jurisdiction] = "core"
         self.training_mode: bool = True
         self.frozen_core: bool = False
+        self.enable_us_module: bool = True
+        self.enable_eu_module: bool = True
         
         self.apply(self._init_weights)
     
@@ -361,13 +363,22 @@ class GRAMModel(nn.Module):
         
         adapters = None
         if jurisdiction != "core":
+            # Only include enabled modules
+            enabled_jurisdictions = []
+            if self.enable_us_module and "US" in self.config.jurisdictions:
+                enabled_jurisdictions.append("US")
+            if self.enable_eu_module and "EU" in self.config.jurisdictions:
+                enabled_jurisdictions.append("EU")
+            if "general" in self.config.jurisdictions:
+                enabled_jurisdictions.append("general")
+            
             adapters = {
-                jur: self.jurisdiction_adapters[jur] for jur in self.config.jurisdictions
+                jur: self.jurisdiction_adapters[jur] for jur in enabled_jurisdictions
             }
         
         for i, block in enumerate(self.blocks):
             active_adapter = None
-            if adapters and jurisdiction != "core":
+            if adapters and jurisdiction != "core" and jurisdiction in adapters:
                 active_adapter = {jurisdiction: adapters[jurisdiction][i]}
             
             x = block(
