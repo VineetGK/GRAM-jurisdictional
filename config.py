@@ -55,6 +55,10 @@ class Config:
     d_ff: int = 3072
     dropout: float = 0.1
     module_mlp_ratio: float = 0.25
+    adapter_rank: int = 16
+    adapter_alpha: float = 32.0
+    adapter_dropout: float = 0.1
+    jurisdictions: List[str] = None
     
     enable_us_module: bool = True
     enable_eu_module: bool = True
@@ -97,6 +101,8 @@ class Config:
         for dir_path in [self.data_dir, self.tokenizer_dir, self.checkpoint_dir, 
                          self.log_dir, self.output_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
+        if self.jurisdictions is None:
+            self.jurisdictions = ["US", "EU", "general"]
     
     @property
     def module_d_model(self) -> int:
