@@ -194,9 +194,9 @@ def render_sidebar():
         selected_config = config.app_mode_to_config[mode]
 
         # Display active config
-        config_class = get_config_class(config)
+        config_class = get_config_class(selected_config)
         st.markdown(
-            f'<div class="config-badge {config_class}">Active: {get_config_display_name(config)}</div>',
+            f'<div class="config-badge {config_class}">Active: {get_config_display_name(selected_config)}</div>',
             unsafe_allow_html=True,
         )
 

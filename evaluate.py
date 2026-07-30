@@ -218,6 +218,7 @@ def load_test_data(
                 tokenizer, "EU",
                 max_length=max_length,
                 num_samples=sample_size,
+                dataset_config="eurlex",
             )
         elif jurisdiction == "general":
             ds = LegalIterableDataset(
@@ -225,6 +226,7 @@ def load_test_data(
                 tokenizer, "general",
                 max_length=max_length,
                 num_samples=sample_size,
+                dataset_config="20220301.en",
             )
         else:
             raise ValueError(f"Unknown jurisdiction: {jurisdiction}")

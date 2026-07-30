@@ -106,6 +106,7 @@ class LegalIterableDataset(IterableDataset):
         chunk_size: int = 512,
         chunk_overlap: int = 50,
         num_samples: int = None,
+        dataset_config: str = None,
     ):
         self.dataset_name = dataset_name
         self.split = split
@@ -115,10 +116,11 @@ class LegalIterableDataset(IterableDataset):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.num_samples = num_samples
+        self.dataset_config = dataset_config
         self.jur_to_id = {"general": 0, "US": 1, "EU": 2}
 
     def __iter__(self) -> Iterator[Dict]:
-        ds = load_dataset(self.dataset_name, split=self.split, streaming=True, token=HF_TOKEN)
+        ds = load_dataset(self.dataset_name, self.dataset_config, split=self.split, streaming=True, token=HF_TOKEN)
         jur_id = self.jur_to_id.get(self.jurisdiction, 0)
         count = 0
 
@@ -184,6 +186,7 @@ def collate_batch(batch: List[Dict], pad_token_id: int = 0, max_length: int = 51
     input_ids = torch.stack(padded_ids)
     attention_mask = torch.stack(attention_masks)
     labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
     jurisdiction = torch.tensor(jurisdictions, dtype=torch.long)
 
     return JurisdictionBatch(
@@ -212,12 +215,13 @@ def create_dataloaders(
     eu_sample = eu_sample_size or config.eu_sample_size
     general_sample = general_sample_size or config.general_sample_size
 
-    def create_loader(dataset_name, split, jur, sample_size, shuffle=True):
+    def create_loader(dataset_name, split, jur, sample_size, shuffle=True, dataset_config=None):
         if use_streaming:
             ds = LegalIterableDataset(
                 dataset_name, split, tokenizer, jur,
                 max_length=max_length,
                 num_samples=sample_size,
+                dataset_config=dataset_config,
             )
             return DataLoader(
                 ds,
@@ -228,7 +232,7 @@ def create_dataloaders(
         else:
             # For non-streaming, we'd need to load into memory first
             # Using a simple approach here
-            ds = load_dataset(dataset_name, split=split, streaming=True, token=HF_TOKEN)
+            ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True, token=HF_TOKEN)
             texts = []
             for i, ex in enumerate(ds):
                 text = ex.get("text", ex.get("content", ""))
@@ -269,11 +273,11 @@ def create_dataloaders(
     try:
         eu_train = create_loader(
             "lex_glue", "train", "EU",
-            eu_sample, shuffle=True
+            eu_sample, shuffle=True, dataset_config="eurlex"
         )
         eu_val = create_loader(
             "lex_glue", "train", "EU",
-            eu_sample // 10, shuffle=False
+            eu_sample // 10, shuffle=False, dataset_config="eurlex"
         )
     except Exception as e:
         print(f"Could not load EUR-Lex: {e}, using dummy data")
@@ -284,11 +288,11 @@ def create_dataloaders(
     try:
         general_train = create_loader(
             "wikipedia", "train", "general",
-            general_sample, shuffle=True
+            general_sample, shuffle=True, dataset_config="20220301.en"
         )
         general_val = create_loader(
             "wikipedia", "train", "general",
-            general_sample // 10, shuffle=False
+            general_sample // 10, shuffle=False, dataset_config="20220301.en"
         )
     except Exception as e:
         print(f"Could not load Wikipedia: {e}, using dummy data")

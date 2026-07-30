@@ -57,7 +57,6 @@ class Config:
     us_data_path: Optional[Path] = None  # e.g., data/us_caselaw/
     eu_data_path: Optional[Path] = None  # e.g., data/eurlex/
     general_data_path: Optional[Path] = None  # e.g., data/wikipedia/
-    hf_token: Optional[str] = None  # HuggingFace token for gated datasets
 
     # Sample sizes for quick prototyping
     us_sample_size: int = 10000
