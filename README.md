@@ -1,4 +1,4 @@
-# GRAM for Law: Jurisdiction-Aware Legal Language Model
+# GRAM for Law: Jurisdiction-Aware Legal Language Model.
 
 Implementation of **GRAM (Gradient-Routed Auxiliary Modules)** for modular pretraining of a legal LLM with US and EU jurisdiction modules, plus a Streamlit chat interface.
 
