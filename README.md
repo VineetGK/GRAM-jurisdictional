@@ -30,6 +30,8 @@ Based on: *Modular Pretraining Enables Access Control* (GRAM paper)
 ```bash
 pip install -r requirements.txt
 ```
+Tested with Python 3.10+ and PyTorch GPU builds.
+
 
 ## Quick Start
 
